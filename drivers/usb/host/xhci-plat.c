@@ -251,6 +251,7 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	}
 
 	if (priv && priv->is_mtk_v2) {
+		struct resource *region1, *region2, *region3;
 
 		wakeup_irq = platform_get_irq_optional(pdev, 1);
 		if (wakeup_irq == -EPROBE_DEFER) {
@@ -258,16 +259,38 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 			goto disable_clk;
 		}
 
-		ret = xhci_mtk_get_resources(pdev, xhci);
-		if (ret)
-			goto disable_clk;
+		/*
+		 * Shipping Lenovo S0QKT0EA firmware describes a 0x100-byte region,
+		 * a 0x4000/0x5000-byte region and a 24/28-byte auxiliary region
+		 * after the xHCI register resource.
+		 * It predates the ext-MAC/IPPC/PHY layout used by the v2 glue.
+		 * Treating the auxiliary region as PHY accesses unmapped MMIO.
+		 * Preserve firmware initialization and the generic xHCI PM path
+		 * for that layout; still register its dedicated ACPI wake IRQ.
+		 */
+		region1 = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+		region2 = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+		region3 = platform_get_resource(pdev, IORESOURCE_MEM, 3);
+		if (region1 && region2 && region3 &&
+		    resource_size(region1) == 0x100 &&
+		    (resource_size(region2) == 0x4000 ||
+		     resource_size(region2) == 0x5000) &&
+		    (resource_size(region3) == 0x18 ||
+		     resource_size(region3) == 0x1c)) {
+			dev_warn(&pdev->dev,
+				 "legacy ACPI resources: using firmware-initialized xHCI without v2 power gating\n");
+			priv->is_mtk_v2 = false;
+		} else {
+			ret = xhci_mtk_get_resources(pdev, xhci);
+			if (ret)
+				goto disable_clk;
 
-		ret = xhci_mtk_prepare_hw(xhci);
-		if (ret) {
-			goto free_rscs;
+			ret = xhci_mtk_prepare_hw(xhci);
+			if (ret)
+				goto free_rscs;
+
+			mtk_hw_prepared = true;
 		}
-
-		mtk_hw_prepared = true;
 	}
 
 	device_set_wakeup_capable(&pdev->dev, true);
@@ -548,8 +571,7 @@ void xhci_plat_remove(struct platform_device *dev)
 			xhci_plat_hc_died(xhci, mtk_hw_accessible);
 	}
 
-	if (priv->is_mtk_v2)
-		dev_pm_clear_wake_irq(&dev->dev);
+	dev_pm_clear_wake_irq(&dev->dev);
 
 	if (shared_hcd) {
 		usb_remove_hcd(shared_hcd);
