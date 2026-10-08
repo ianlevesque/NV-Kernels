@@ -254,6 +254,9 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 		struct resource *region1, *region2, *region3;
 
 		wakeup_irq = platform_get_irq_optional(pdev, 1);
+		/* Retail ACPI tables describe wake as GpioInt, not Interrupt[1]. */
+		if (wakeup_irq == -ENXIO && ACPI_COMPANION(&pdev->dev))
+			wakeup_irq = acpi_dev_gpio_irq_get(ACPI_COMPANION(&pdev->dev), 0);
 		if (wakeup_irq == -EPROBE_DEFER) {
 			ret = wakeup_irq;
 			goto disable_clk;
