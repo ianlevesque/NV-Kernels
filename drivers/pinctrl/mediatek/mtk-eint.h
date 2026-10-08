@@ -37,6 +37,7 @@ struct mtk_eint_regs {
 };
 
 struct mtk_eint_hw {
+	bool supports_non_gpio_eint;
 	u8		port_mask;
 	u8		ports;
 	unsigned int	ap_num;

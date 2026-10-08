@@ -1411,6 +1411,7 @@ static const struct mtk_eint_hw mt8901_eint_hw = {
 	.db_cnt    = 32,
 	.db_time   = debounce_time_mt8901,
 	.has_event_mask = true,
+	.supports_non_gpio_eint = true,
 };
 
 static const unsigned int mt8901_eint_event_unmask[] = {20};

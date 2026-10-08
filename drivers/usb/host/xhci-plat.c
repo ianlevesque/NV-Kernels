@@ -19,6 +19,8 @@
 #include <linux/usb/phy.h>
 #include <linux/slab.h>
 #include <linux/acpi.h>
+#include <linux/irq.h>
+#include <linux/irqdomain.h>
 #include <linux/usb/of.h>
 #include <linux/reset.h>
 #include <linux/usb/xhci-sideband.h>
@@ -30,6 +32,63 @@
 #include "xhci-mtk-v2.h"
 
 static struct hc_driver __read_mostly xhci_plat_hc_driver;
+
+struct xhci_mtk_legacy_wake {
+	struct device *dev;
+	u32 eint;
+	int irq;
+};
+
+static acpi_status xhci_mtk_legacy_wake_resource(struct acpi_resource *res, void *data)
+{
+	struct xhci_mtk_legacy_wake *wake = data;
+	struct acpi_resource_gpio *gpio;
+	struct acpi_device *controller;
+	struct irq_domain *domain;
+	acpi_handle handle;
+	int ret;
+
+	if (res->type != ACPI_RESOURCE_TYPE_GPIO || wake->irq > 0)
+		return AE_OK;
+	gpio = &res->data.gpio;
+	if (gpio->connection_type != ACPI_RESOURCE_GPIO_TYPE_INT ||
+	    !gpio->resource_source.string_ptr)
+		return AE_OK;
+	if (ACPI_FAILURE(acpi_get_handle(ACPI_HANDLE(wake->dev),
+					gpio->resource_source.string_ptr, &handle)))
+		return AE_OK;
+	controller = acpi_fetch_acpi_dev(handle);
+	if (!controller)
+		return AE_OK;
+	domain = irq_find_matching_fwnode(acpi_fwnode_handle(controller), DOMAIN_BUS_ANY);
+	if (!domain) {
+		wake->irq = -EPROBE_DEFER;
+		return AE_OK;
+	}
+	wake->irq = irq_find_mapping(domain, wake->eint);
+	if (!wake->irq) {
+		wake->irq = -ENXIO;
+		return AE_OK;
+	}
+	ret = irq_set_irq_type(wake->irq,
+			      acpi_dev_get_irq_type(gpio->triggering, gpio->polarity));
+	if (ret)
+		wake->irq = ret;
+	return AE_OK;
+}
+
+static int xhci_mtk_legacy_wake_irq(struct platform_device *pdev)
+{
+	struct xhci_mtk_legacy_wake wake = { .dev = &pdev->dev, .irq = -ENXIO };
+	acpi_status status;
+
+	/* Retail firmware gives the internal EINT separately from its GPIO pin. */
+	if (device_property_read_u32(&pdev->dev, "wakeup_gpio_irq", &wake.eint))
+		return -ENXIO;
+	status = acpi_walk_resources(ACPI_HANDLE(&pdev->dev), "_CRS",
+				     xhci_mtk_legacy_wake_resource, &wake);
+	return ACPI_FAILURE(status) ? -ENXIO : wake.irq;
+}
 
 static int xhci_plat_setup(struct usb_hcd *hcd);
 static int xhci_plat_start(struct usb_hcd *hcd);
@@ -282,6 +341,13 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 		     resource_size(region3) == 0x1c)) {
 			dev_warn(&pdev->dev,
 				 "legacy ACPI resources: using firmware-initialized xHCI without v2 power gating\n");
+			if (wakeup_irq < 0) {
+				wakeup_irq = xhci_mtk_legacy_wake_irq(pdev);
+				if (wakeup_irq == -EPROBE_DEFER) {
+					ret = wakeup_irq;
+					goto disable_clk;
+				}
+			}
 			priv->is_mtk_v2 = false;
 		} else {
 			ret = xhci_mtk_get_resources(pdev, xhci);
