@@ -30,9 +30,6 @@
  * SOFTWARE.
  */
 
-#include <linux/dmi.h>
-#include <linux/suspend.h>
-#include <linux/xarray.h>
 #include <linux/highmem.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -89,26 +86,6 @@ MODULE_PARM_DESC(debug_mask, "debug mask: 1 = dump cmd data, 2 = dump cmd exec t
 static unsigned int prof_sel = MLX5_DEFAULT_PROF;
 module_param_named(prof_sel, prof_sel, uint, 0444);
 MODULE_PARM_DESC(prof_sel, "profile selector. Valid range 0 - 2");
-
-/* GB10 s2idle keeps ConnectX-7 powered. Opt in only after the coordinator
- * has drained all distributed work; tearing down the auxiliary RDMA device
- * would otherwise invalidate live QPs and registered memory. No ABI changes.
- */
-static bool spark_retain_rdma;
-module_param_named(spark_retain_rdma, spark_retain_rdma, bool, 0444);
-MODULE_PARM_DESC(spark_retain_rdma,
-		"Experimental: retain ConnectX-7 contexts during drained DGX Spark s2idle (default off)");
-static DEFINE_XARRAY(spark_retained_devices);
-
-static bool mlx5_spark_s2idle_retention(struct pci_dev *pdev)
-{
-	return spark_retain_rdma &&
-	       pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
-	       pdev->device == 0x1021 &&
-	       (dmi_match(DMI_PRODUCT_NAME, "NVIDIA_DGX_Spark") ||
-		(dmi_match(DMI_SYS_VENDOR, "LENOVO") &&
-		 dmi_match(DMI_PRODUCT_FAMILY, "DGX Spark")));
-}
 
 static u32 sw_owner_id[4];
 #define MAX_SW_VHCA_ID (BIT(__mlx5_bit_sz(cmd_hca_cap_2, sw_vhca_id)) - 1)
@@ -2258,21 +2235,17 @@ static void shutdown(struct pci_dev *pdev)
 	mlx5_pci_disable_device(dev);
 }
 
+/* Private helpers live separately to preserve main.c's symbol type CRCs. */
+int mlx5_spark_pm_suspend(struct pci_dev *pdev, pm_message_t state);
+bool mlx5_spark_pm_resume(struct pci_dev *pdev);
+
 static int mlx5_suspend(struct pci_dev *pdev, pm_message_t state)
 {
 	struct mlx5_core_dev *dev = pci_get_drvdata(pdev);
+	int ret = mlx5_spark_pm_suspend(pdev, state);
 
-	if (state.event == PM_EVENT_SUSPEND &&
-	    mlx5_spark_s2idle_retention(pdev)) {
-		void *entry;
-
-		entry = xa_store(&spark_retained_devices, (unsigned long)pdev,
-				 xa_mk_value(1), GFP_KERNEL);
-		if (xa_is_err(entry))
-			return xa_err(entry);
-		mlx5_core_info(dev, "Retaining powered ConnectX-7 contexts for DGX Spark s2idle\n");
-		return 0;
-	}
+	if (ret <= 0)
+		return ret;
 
 	mlx5_unload_one(dev, true);
 
@@ -2283,10 +2256,8 @@ static int mlx5_resume(struct pci_dev *pdev)
 {
 	struct mlx5_core_dev *dev = pci_get_drvdata(pdev);
 
-	if (xa_erase(&spark_retained_devices, (unsigned long)pdev)) {
-		mlx5_core_info(dev, "Resuming retained ConnectX-7 contexts after DGX Spark s2idle\n");
+	if (mlx5_spark_pm_resume(pdev))
 		return 0;
-	}
 
 	return mlx5_load_one(dev, false);
 }
