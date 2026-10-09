@@ -1780,6 +1780,39 @@ static ssize_t debug_state_store(struct device *dev,
 
 DEVICE_ATTR_RW(debug_state);
 
+/* debug_state reports the requested power state, not link readiness. */
+static ssize_t link_state_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	static const char * const names[] = {
+		[STATE_READY] = "ready",
+		[STATE_PLUG_OUT] = "plug-out",
+		[STATE_DEV_POWER_OFF] = "powered-off",
+		[STATE_PLUG_IN] = "plug-in",
+		[STATE_DEV_POWER_ON] = "powered-on",
+		[STATE_DEV_FW_START] = "firmware-start",
+		[STATE_RESCAN] = "training",
+		[STATE_UNKNOWN] = "unknown",
+	};
+	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
+	enum cx7_hp_state state;
+	unsigned long flags;
+
+	if (!hp_dev)
+		return -EINVAL;
+
+	spin_lock_irqsave(&hp_dev->lock, flags);
+	state = hp_dev->state;
+	spin_unlock_irqrestore(&hp_dev->lock, flags);
+
+	if (state >= ARRAY_SIZE(names))
+		return -EIO;
+
+	return sysfs_emit(buf, "%s\n", names[state]);
+}
+
+static DEVICE_ATTR_RO(link_state);
+
 static ssize_t hotplug_enabled_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
 {
@@ -1816,6 +1849,7 @@ DEVICE_ATTR_RW(hotplug_enabled);
 
 static struct attribute *cx7_hp_attrs[] = {
 	&dev_attr_debug_state.attr,
+	&dev_attr_link_state.attr,
 	&dev_attr_hotplug_enabled.attr,
 	NULL
 };
