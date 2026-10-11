@@ -1376,10 +1376,21 @@ static int rescan_device(struct cx7_hp_dev *dev)
 		}
 	}
 
-	gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
-
 	for (i = 0; i < dev->pd->port_nums; i++)
 		cx7_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
+
+	/*
+	 * Diagnostic only: prepare both host links before releasing the shared
+	 * endpoint reset. Keep power, enumeration, readiness and AER handling
+	 * unchanged. Allow 100 ms for the prepared clocks and PHYs to settle,
+	 * following the PCIe TPVPERL interval used by the upstream MediaTek
+	 * controller. This tests initialization order; it is not a qualified
+	 * remedy for the Spark post-hotplug bandwidth regression.
+	 */
+	msleep(100);
+	dev_info(&dev->pdev->dev,
+		 "Diagnostic: releasing PERST after both root ports prepared\n");
+	gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
 
 	err = polling_link_to_l0(dev);
 	if (err)
