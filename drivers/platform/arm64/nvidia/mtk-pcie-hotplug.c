@@ -54,6 +54,18 @@
 #define BUS_PROTECT_CABLE_PLUGIN	2
 #define BUS_PROTECT_CLEANUP		3
 
+/*
+ * Diagnostic branch only: isolate CX7 supply loss from the host PHY/clock
+ * reset sequence. Endpoint removal, LTSSM disable, PERST and EN sequencing
+ * remain in force. Do not infer a production power-saving fix from this
+ * experiment; compare same-boot RDMA before/after the verified supply cut.
+ * Read-only after module load so removal and insertion use the same recipe.
+ */
+static bool diagnostic_keep_root_phy = true;
+module_param(diagnostic_keep_root_phy, bool, 0444);
+MODULE_PARM_DESC(diagnostic_keep_root_phy,
+	"Diagnostic: retain root PHY/clock while fully powering off CX7");
+
 enum cx7_hp_state {
 	STATE_READY = 0,
 	STATE_PLUG_OUT,		/* Cable plug-out */
@@ -210,6 +222,7 @@ struct cx7_hp_dev {
 	int prsnt_pin;
 	enum cx7_hp_debug_val debug_state;
 	bool hotplug_enabled;
+	bool root_phy_retained;
 	spinlock_t lock;
 	struct pci_dev *cached_root_ports[HP_PORT_MAX];
 	struct cx7_hp_mmio_runtime mmio;
@@ -1156,10 +1169,20 @@ static void cx7_hp_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx,
 						       mmio_info->mac.init_ctrl,
 						       mmio_info->mac.ltssm_bit,
 						       false);
+				if (dev->root_phy_retained)
+					return;
 				cx7_hp_reg_update_bits(mac_base,
 						       mmio_info->mac.init_ctrl,
 						       mmio_info->mac.
 						       phy_rst_bit, false);
+				return;
+			}
+
+			if (dev->root_phy_retained) {
+				/* The host PHY was never reset or clock-gated. */
+				cx7_hp_reg_update_bits(mac_base,
+						       mmio_info->mac.init_ctrl,
+						       mmio_info->mac.ltssm_bit, true);
 				return;
 			}
 
@@ -1273,15 +1296,31 @@ static struct pci_dev *get_port_root_port(struct cx7_hp_dev *hp_dev,
 static void remove_device(struct cx7_hp_dev *dev)
 {
 	int i;
+	struct rp_bus_mmio_info *info = &dev->pd->rp_bus_mmio;
 
-	dev_info(&dev->pdev->dev, "Cable removal\n");
+	/* Cold insertion still needs the normal clock/PHY initialization. */
+	dev->root_phy_retained = diagnostic_keep_root_phy &&
+		dev->mmio.ckm_base &&
+		!(readl(dev->mmio.ckm_base + info->ckm.ctrl) &
+		  info->ckm.disable_bit);
+	for (i = 0; dev->root_phy_retained && i < dev->pd->port_nums; i++) {
+		if (!dev->mmio.mac_port_base[i] ||
+		    !(readl(dev->mmio.mac_port_base[i] + info->mac.init_ctrl) &
+		      info->mac.phy_rst_bit))
+			dev->root_phy_retained = false;
+	}
+
+	dev_info(&dev->pdev->dev, "Cable removal (root_phy_retained=%d)\n",
+		 dev->root_phy_retained);
 
 	for (i = 0; i < dev->pd->port_nums; i++)
 		cx7_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
 
 	gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 0);
-	cx7_hp_change_pinctrl_state(dev, "default");
-	cx7_hp_ckm_control(dev, true);
+	if (!dev->root_phy_retained) {
+		cx7_hp_change_pinctrl_state(dev, "default");
+		cx7_hp_ckm_control(dev, true);
+	}
 	gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
 }
 
@@ -1356,11 +1395,13 @@ static int rescan_device(struct cx7_hp_dev *dev)
 	struct pci_dev *pci_dev;
 	int i, err;
 
-	err = cx7_hp_change_pinctrl_state(dev, "clkreqn");
-	if (err)
-		return err;
+	if (!dev->root_phy_retained) {
+		err = cx7_hp_change_pinctrl_state(dev, "clkreqn");
+		if (err)
+			return err;
 
-	cx7_hp_ckm_control(dev, false);
+		cx7_hp_ckm_control(dev, false);
+	}
 	usleep_range(CX7_HP_DELAY_STANDARD_US, CX7_HP_DELAY_STANDARD_US + 1000);
 
 	for (i = 0; i < dev->pd->port_nums; i++) {
@@ -1392,6 +1433,7 @@ static int rescan_device(struct cx7_hp_dev *dev)
 	}
 
 	msleep(CX7_HP_DELAY_LINK_STABLE_MS);
+	dev->root_phy_retained = false;
 
 	return 0;
 }
