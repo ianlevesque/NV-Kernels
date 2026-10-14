@@ -278,6 +278,12 @@ rpcrdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 wake_connect_worker:
 		wake_up_all(&ep->re_connect_wait);
 		return 0;
+	case RDMA_CM_EVENT_DEVICE_REMOVAL:
+		/* The CM cancels further connection events after this callback.
+		 * An unfinished connect must leave its wait and release the ID.
+		 */
+		WRITE_ONCE(ep->re_device_removed, true);
+		goto wake_connect_worker;
 	case RDMA_CM_EVENT_DISCONNECTED:
 		ep->re_connect_status = -ECONNABORTED;
 		rpcrdma_force_disconnect(ep);
@@ -292,9 +298,20 @@ wake_connect_worker:
 static void rpcrdma_ep_removal_done(struct rpcrdma_notification *rn)
 {
 	struct rpcrdma_ep *ep = container_of(rn, struct rpcrdma_ep, re_rn);
+	struct rdma_cm_id *id = ep->re_id;
 
-	trace_xprtrdma_device_removal(ep->re_id);
+	/* The connect worker holds the transport send lock while waiting
+	 * for a CM event. Queuing a disconnect alone cannot release that
+	 * lock. Wake the worker explicitly, including removal before it
+	 * starts waiting. Keep the endpoint alive until notification ends.
+	 */
+	rpcrdma_ep_get(ep);
+	trace_xprtrdma_device_removal(id);
+	WRITE_ONCE(ep->re_device_removed, true);
 	xprt_force_disconnect(ep->re_xprt);
+	wake_up_all(&ep->re_connect_wait);
+	if (rpcrdma_ep_put(ep))
+		rdma_destroy_id(id);
 }
 
 static struct rdma_cm_id *rpcrdma_create_id(struct rpcrdma_xprt *r_xprt,
@@ -401,6 +418,8 @@ static int rpcrdma_ep_create(struct rpcrdma_xprt *r_xprt)
 		return -ENOTCONN;
 	ep->re_xprt = &r_xprt->rx_xprt;
 	kref_init(&ep->re_kref);
+	/* Removal notification can run as soon as create_id registers it. */
+	init_waitqueue_head(&ep->re_connect_wait);
 
 	id = rpcrdma_create_id(r_xprt, ep);
 	if (IS_ERR(id)) {
@@ -428,7 +447,6 @@ static int rpcrdma_ep_create(struct rpcrdma_xprt *r_xprt)
 
 	ep->re_send_batch = ep->re_max_requests >> 3;
 	ep->re_send_count = ep->re_send_batch;
-	init_waitqueue_head(&ep->re_connect_wait);
 
 	ep->re_attr.send_cq = ib_alloc_cq_any(device, r_xprt,
 					      ep->re_attr.cap.max_send_wr,
@@ -495,8 +513,8 @@ static int rpcrdma_ep_create(struct rpcrdma_xprt *r_xprt)
 	return 0;
 
 out_destroy:
-	rpcrdma_ep_put(ep);
-	rdma_destroy_id(id);
+	if (rpcrdma_ep_put(ep))
+		rdma_destroy_id(id);
 	return rc;
 }
 
@@ -526,6 +544,10 @@ int rpcrdma_xprt_connect(struct rpcrdma_xprt *r_xprt)
 	rpcrdma_ep_get(ep);
 	rpcrdma_post_recvs(r_xprt, 1);
 
+	if (READ_ONCE(ep->re_device_removed)) {
+		rc = -ENODEV;
+		goto out;
+	}
 	rc = rdma_connect(ep->re_id, &ep->re_remote_cma);
 	if (rc)
 		goto out;
@@ -533,9 +555,11 @@ int rpcrdma_xprt_connect(struct rpcrdma_xprt *r_xprt)
 	if (xprt->reestablish_timeout < RPCRDMA_INIT_REEST_TO)
 		xprt->reestablish_timeout = RPCRDMA_INIT_REEST_TO;
 	wait_event_interruptible(ep->re_connect_wait,
+				 READ_ONCE(ep->re_device_removed) ||
 				 ep->re_connect_status != 0);
-	if (ep->re_connect_status <= 0) {
-		rc = ep->re_connect_status;
+	if (READ_ONCE(ep->re_device_removed) || ep->re_connect_status <= 0) {
+		rc = READ_ONCE(ep->re_device_removed) ? -ENODEV :
+			 ep->re_connect_status;
 		goto out;
 	}
 
